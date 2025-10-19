@@ -26,8 +26,8 @@ from numpyro.infer import (
 )
 
 from jaxopt import LBFGS
-
-
+# Set the default device to CPU
+jax.config.update('jax_platform_name', 'cpu')
 # -----------------------------
 # Kernel
 def kernel_base(X, Z, var, length):
@@ -190,7 +190,7 @@ def run_map_lbfgs(args, X, Y):
         "z_noise": jnp.array(-2.3),             # log ~ 0.1
     }
 
-    solver = LBFGS(fun=neg_log_post, maxiter=args.lbfgs_max_iter, tol=args.lbfgs_tol)
+    solver = LBFGS(fun=neg_log_post, maxiter=args.lbfgs_max_iter, tol=args.lbfgs_tol, linesearch="backtracking")
     res = solver.run(init_params)
     z_var, z_len, z_noise = res.params["z_var"], res.params["z_len"], res.params["z_noise"]
     var, length, noise = jnp.exp(z_var), jnp.exp(z_len), jnp.exp(z_noise)
@@ -314,8 +314,8 @@ if __name__ == "__main__":
     p.add_argument("--inference", type=str, choices=["map", "mcmc"], default="map")
 
     # MAP (LBFGS) controls
-    p.add_argument("--lbfgs-max-iter", type=int, default=200)
-    p.add_argument("--lbfgs-tol", type=float, default=1e-7)
+    p.add_argument("--lbfgs-max-iter", type=int, default=100)
+    p.add_argument("--lbfgs-tol", type=float, default=1e-5)
 
     # MCMC controls
     p.add_argument("-n", "--num-samples", default=1000, type=int)
@@ -331,8 +331,9 @@ if __name__ == "__main__":
     p.add_argument("--no-cholesky", action="store_true", default=False)
     p.add_argument("--jitter", type=float, default=1e-6)
     p.add_argument("--alpha-ci", type=float, default=0.90)
-    p.add_argument("--prior-scale", type=float, default=0.5)
-    p.add_argument("--prior-loc-noise", type=float, default=-2.3)
+    p.add_argument("--prior-scale", type=float, default=5.0)
+    p.add_argument("--prior-loc-noise", type=float, default=-2.0)
 
     args = p.parse_args()
+    
     main(args)

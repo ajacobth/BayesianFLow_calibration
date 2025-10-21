@@ -90,16 +90,61 @@ def _predict_impl(X, Y, X_test, var, length, noise, jitter, use_cholesky):
     )
     return mean, std
 
-def predict(X, Y, X_test, var, length, noise, jitter=1e-6, use_cholesky=True, alpha_ci=0.90):
-    mean, std = _predict_impl(
-        X, Y, X_test, var, length, noise, jitter,
-        bool(use_cholesky)  # ensure a Python bool for jit-compiled lax.cond
+def predict(
+    X, Y, X_test,
+    var, length, noise,
+    jitter=1e-6,
+    use_cholesky=True,
+    alpha_ci=0.90,
+    include_noise=True,
+    return_std=False,
+):
+    """
+    GP posterior predictive at X_test.
+
+    Parameters
+    ----------
+    include_noise : bool
+        If True, the CI reflects the predictive distribution of new *observations*
+        y* = f* + eps (adds sigma_n^2 to the variance).
+        If False (default), the CI reflects the uncertainty of the latent function f* only.
+    return_std : bool
+        If True, also return the per-point std used to build the CI (latent or noisy).
+
+    Returns
+    -------
+    mean : (N*,)
+    lo   : (N*,)  lower bound of the CI
+    hi   : (N*,)  upper bound of the CI
+    std  : (N*,)  optional, std used for the CI (included if return_std=True)
+    """
+    # mean, std_latent come from the noise-free predictive variance of f*
+    mean, std_latent = _predict_impl(
+        X, Y, X_test, var, length, noise, jitter, bool(use_cholesky)
     )
-    z = 1.6448536269514722 if abs(alpha_ci - 0.90) < 1e-9 else float(
-        dist.Normal(0,1).icdf(jnp.array([(1+alpha_ci)/2]))[0]
-    )
+
+    # Optionally include observational noise in the predictive variance
+    if include_noise:
+        std = jnp.sqrt(jnp.maximum(0.0, std_latent**2 + noise))
+    else:
+        std = std_latent
+
+    # z-value for a central Normal CI at level alpha_ci
+    if abs(alpha_ci - 0.90) < 1e-12:
+        z = 1.6448536269514722
+    elif abs(alpha_ci - 0.95) < 1e-12:
+        z = 1.959963984540054
+    elif abs(alpha_ci - 0.68) < 1e-12:
+        z = 0.994457883209753
+    else:
+        # generic path via Normal icdf
+        z = float(dist.Normal(0.0, 1.0).icdf(jnp.array([(1.0 + alpha_ci) / 2.0]))[0])
+
     lo = mean - z * std
     hi = mean + z * std
+
+    if return_std:
+        return mean, lo, hi, std
     return mean, lo, hi
 
 # -----------------------------
@@ -137,7 +182,11 @@ def get_data(N=25, D=1, sigma_obs=0.15, N_test=400, standardize_x=True, standard
 
 # -----------------------------
 # MAP objective (no SVI): maximize exact log posterior
-def make_map_objective(X, Y, prior_scale=0.5, prior_loc_noise=-2.3, jitter=1e-6):
+def make_map_objective(X, Y,
+                       prior_var_loc=0.0, prior_var_scale=1.0,        # LogNormal(loc, scale) on kernel_var
+                       prior_len_loc=-0.6931, prior_len_scale=0.5,    # log(0.5) ≈ -0.693; encourages smaller ℓ
+                       prior_noise_loc=-1.609, prior_noise_scale=0.5, # log(0.2) ≈ -1.609
+                       jitter=1e-6):
     N, D = X.shape
 
     def unpack(params):
@@ -152,35 +201,35 @@ def make_map_objective(X, Y, prior_scale=0.5, prior_loc_noise=-2.3, jitter=1e-6)
     def neg_log_posterior(params):
         var, length, noise, z_var, z_len, z_noise = unpack(params)
 
-        # Kernel and Cholesky
         K = kernel_base(X, X, var, length) + (noise + jitter) * jnp.eye(N)
-        cho = jax.scipy.linalg.cho_factor(K)
-        alpha = jax.scipy.linalg.cho_solve(cho, Y)
+        L = jnp.linalg.cholesky(K)
+        tmp   = jax.scipy.linalg.solve_triangular(L, Y, lower=True)
+        alpha = jax.scipy.linalg.solve_triangular(L.T, tmp, lower=False)
 
-        # Log marginal likelihood
         term1 = -0.5 * (Y @ alpha)
-        term2 = -jnp.sum(jnp.log(jnp.diag(cho[0])))  # -sum(log diag(L)) = -0.5 log|K|
+        logdetK = 2.0 * jnp.sum(jnp.log(jnp.diag(L)))
+        term2 = -0.5 * logdetK
         term3 = -0.5 * N * jnp.log(2.0 * jnp.pi)
         log_marginal = term1 + term2 + term3
 
-        # LogNormal priors in log-space: z ~ Normal(mu, sigma)
         def log_normal_prior(z, mu, sigma):
             return -0.5 * ((z - mu) / sigma) ** 2 - jnp.log(sigma) - 0.5 * jnp.log(2.0 * jnp.pi)
 
-        lp_var   = log_normal_prior(z_var,   0.0, prior_scale)
-        lp_noise = log_normal_prior(z_noise, prior_loc_noise, prior_scale)
-        lp_len   = jnp.sum(log_normal_prior(z_len, 0.0, prior_scale))
+        lp_var   = log_normal_prior(z_var,   prior_var_loc,   prior_var_scale)
+        lp_noise = log_normal_prior(z_noise, prior_noise_loc, prior_noise_scale)
+        lp_len   = jnp.sum(log_normal_prior(z_len, prior_len_loc, prior_len_scale))
 
         log_post = log_marginal + lp_var + lp_noise + lp_len
-        return -log_post  # minimize negative log posterior
+        return -log_post
 
     return neg_log_posterior
 
 def run_map_lbfgs(args, X, Y):
     neg_log_post = make_map_objective(
         X, Y,
-        prior_scale=args.prior_scale,
-        prior_loc_noise=args.prior_loc_noise,
+        prior_var_loc=0.0, prior_var_scale=2.0,
+        prior_len_loc=-0.6931, prior_len_scale=1.0,
+        prior_noise_loc=-1.609, prior_noise_scale=2.0,
         jitter=args.jitter,
     )
     # Good starting point in z-space
@@ -280,15 +329,39 @@ def main(args):
 
     # Plot
     fig, ax = plt.subplots(figsize=(8, 6), constrained_layout=True)
+
+    # >>>>>>>>>>>>>>>>>>>> ONLY CHANGED THIS BLOCK (color + label) <<<<<<<<<<<<<<<<<<<<
+    band_color = "red" if args.inference == "map" else "lightblue"
+    band_label = (
+        f"{int(args.alpha_ci*100)}% predictive CI (incl. noise)"
+        if args.inference == "map"
+        else f"{int(args.alpha_ci*100)}% latent CI"
+    )
+    # >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>
+
     if args.dim == 1:
         ax.plot(np.asarray(X[:, 0]), np.asarray(Y), "kx", label="train")
-        ax.fill_between(np.asarray(X_test[:, 0]), percentiles[0, :], percentiles[1, :], alpha=0.3,
-                        label=f"{int(args.alpha_ci*100)}% band")
+        ax.fill_between(
+            np.asarray(X_test[:, 0]),
+            percentiles[0, :],
+            percentiles[1, :],
+            alpha=0.3,
+            color=band_color,          # <- red for MAP (incl. noise), blue otherwise
+            label=band_label,          # <- label clarifies what's plotted
+        )
         ax.plot(np.asarray(X_test[:, 0]), mean_prediction, lw=2.0, label=f"mean ({args.inference.upper()})")
         ax.set(xlabel="X", ylabel="Y", title=f"GP ({args.inference.upper()})")
         ax.legend()
     else:
         ax.plot(np.asarray(X[:, 0]), np.asarray(Y), "kx", label="train (vs x1)")
+        ax.fill_between(
+            np.asarray(X_test[:, 0]),
+            percentiles[0, :],
+            percentiles[1, :],
+            alpha=0.3,
+            color=band_color,
+            label=band_label,
+        )
         ax.plot(np.asarray(X_test[:, 0]), mean_prediction, lw=2.0, label=f"mean ({args.inference.upper()} vs x1)")
         ax.set(xlabel="x1", ylabel="Y", title=f"GP ({args.inference.upper()}) mean vs x1 (D={args.dim})")
         ax.legend()

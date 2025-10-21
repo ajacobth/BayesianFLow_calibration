@@ -53,12 +53,19 @@ def model(X, y=None):
 # Diagnostics printer
 def print_diagnostics(samples_by_chain, extra_by_chain, max_tree_depth):
     """
-    Prints: R-hat, ESS (bulk/tail), divergence counts by chain, step size,
-    mean accept prob per chain, and tree-depth cap hits.
+    Prints: R-hat, ESS (bulk/tail if available), divergence counts by chain, and tree-depth saturation.
+    Works with older NumPyro versions (no `method=` argument).
     """
+    # --- compatibility shim for older NumPyro ---
+    def _ess(v, mode=None):
+        try:
+            return np.asarray(effective_sample_size(v, method=mode))
+        except TypeError:
+            return np.asarray(effective_sample_size(v))
+
     rhat = {k: np.asarray(gelman_rubin(v)) for k, v in samples_by_chain.items()}
-    ess_bulk = {k: np.asarray(effective_sample_size(v, method="bulk")) for k, v in samples_by_chain.items()}
-    ess_tail = {k: np.asarray(effective_sample_size(v, method="tail")) for k, v in samples_by_chain.items()}
+    ess_bulk = {k: _ess(v, "bulk") for k, v in samples_by_chain.items()}
+    ess_tail = {k: _ess(v, "tail") for k, v in samples_by_chain.items()}
 
     print("\n=== Convergence diagnostics ===")
     def _fmt(x):
@@ -74,27 +81,26 @@ def print_diagnostics(samples_by_chain, extra_by_chain, max_tree_depth):
             print(f"ESS_tail[{name}] :", _fmt(ess_tail[name]))
 
     # Divergences per chain
-    div = np.asarray(extra_by_chain["diverging"])  # (C, S)
+    div = np.asarray(extra_by_chain["diverging"])
     div_counts = div.sum(axis=1)
     print("\nDivergences per chain:", div_counts.tolist(), f"(total={div_counts.sum()})")
 
-    # Step size, accept prob (final)
     if "step_size" in extra_by_chain:
         ss = np.asarray(extra_by_chain["step_size"])
-        if ss.ndim == 2:  # (C, S)
+        if ss.ndim == 2:
             ss = ss[:, -1]
         print("Final step_size per chain:", np.round(ss, 6).tolist())
 
     if "accept_prob" in extra_by_chain:
-        ap = np.asarray(extra_by_chain["accept_prob"])  # (C, S)
+        ap = np.asarray(extra_by_chain["accept_prob"])
         print("Mean accept_prob per chain:", np.round(ap.mean(axis=1), 3).tolist())
 
-    # Tree-depth saturation
     if "num_steps" in extra_by_chain:
-        ns = np.asarray(extra_by_chain["num_steps"])  # (C, S)
+        ns = np.asarray(extra_by_chain["num_steps"])
         cap = 2 ** max_tree_depth
         sat = (ns >= cap).sum(axis=1)
         print(f"Tree depth cap hits per chain (>= 2**{max_tree_depth} = {cap} steps):", sat.tolist())
+
 
 # -----------------------------
 # Inference (multi-chain NUTS on CPU)
@@ -282,7 +288,7 @@ if __name__ == "__main__":
     ap.add_argument("--sigma-true", type=float, default=0.3)
     ap.add_argument("--num-warmup", type=int, default=800)
     ap.add_argument("--num-samples", type=int, default=1000)
-    ap.add_argument("--chains", type=int, default=4)          # multiple chains by default
+    ap.add_argument("--chains", type=int, default=2)          # multiple chains by default
     ap.add_argument("--alpha-ci", type=float, default=0.90)
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--out-prefix", type=str, default="linreg_cpu")

@@ -31,8 +31,8 @@ class BayesianFLow:
         self.n_train_samples = n_train_samples
         self.n_test_samples = n_test_samples
         
-        self.lb = np.array([0, 1e3, 1e-3, 10, 1.5e-7])
-        self.ub = np.array([1, 1e7, 100, 1e3, 1e-6])
+        self.lb = np.array([0, 1e3, 1e-3, 1e-2, 1.5e-7])
+        self.ub = np.array([1, 1e7, 100, 10., 1e-6])
         
       
     def _sobol_exact(self, n: int, d: int, scramble: bool = True) -> np.ndarray:

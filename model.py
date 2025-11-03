@@ -567,6 +567,8 @@ class MiniGPJax:
             df["y_true_log"] = y_true_log
             df["y_pred_log"] = mu_log
             df.to_csv(out / "test_predictions_log.csv", index=False)
+            
+            self._save_relevance_plots(out)
             return metrics
 
         # --- default: original space (only if explicitly requested or log_y=False) ---
@@ -604,17 +606,6 @@ class MiniGPJax:
         plt.title("Predictive Uncertainty (std)")
         plt.tight_layout(); plt.savefig(out / "pred_uncertainty_vs_index.pdf"); plt.close()
 
-        # ARD relevance bar
-        if self.params is not None:
-            ell = np.asarray(softplus(self.params.kernel.log_length))
-            rel = 1.0 / (ell ** 2); rel /= (rel.sum() + 1e-12)
-            labels = [f"x{i+1}" for i in range(self.dim)]
-            plt.figure(figsize=(7,4))
-            plt.bar(labels, rel)
-            plt.ylabel("normalized relevance ~ 1/ℓ²")
-            plt.title("ARD Feature Relevance")
-            plt.tight_layout(); plt.savefig(out / "ard_relevance_bar.pdf"); plt.close()
-
         # Dump predictions in the requested evaluation space
         df = pd.DataFrame(self.X_test, columns=[f"x{i+1}" for i in range(self.dim)])
         df["y_pred"], df["y_std"] = (y_pred if 'y_pred' in locals() else np.nan), (y_std if 'y_std' in locals() else np.nan)
@@ -622,6 +613,28 @@ class MiniGPJax:
             df["y_true"] = y_true if 'y_true' in locals() else np.nan
         df.to_csv(out / "test_predictions.csv", index=False)
         return metrics
+    
+    def _save_relevance_plots(self, out: Path):
+        if self.params is None:
+            return
+        ell = np.asarray(softplus(self.params.kernel.log_length))
+        labels = [f"x{i+1}" for i in range(self.dim)]
+    
+        # normalized 1/ell^2
+        rel = 1.0 / (ell ** 2); rel /= (rel.sum() + 1e-12)
+        plt.figure(figsize=(7,4))
+        plt.bar(labels, rel)
+        plt.ylabel("normalized relevance ~ 1/ℓ²")
+        plt.title("ARD Feature Relevance")
+        plt.tight_layout(); plt.savefig(out / "ard_relevance_bar.pdf"); plt.close()
+    
+        # plain inverse lengthscales
+        inv_ell = 1.0 / ell
+        plt.figure(figsize=(7,4))
+        plt.bar(labels, inv_ell)
+        plt.ylabel("1 / lengthscale")
+        plt.title("Inverse Lengthscale (Feature Relevance)")
+        plt.tight_layout(); plt.savefig(out / "inverse_lengthscale_bar.pdf"); plt.close()
 
 # -------------------------------
 # Demo
@@ -642,7 +655,7 @@ def _demo():
     )
     gp.load(TRAIN_CSV, TEST_CSV)
     gp.fit(lbfgs_max_iter=50, lbfgs_tol=1e-7, num_restarts=2, seed=42)
-    gp.evaluate_and_plot(outdir="demo_out")  # defaults to "log" when log_y=True
+    gp.evaluate_and_plot(outdir="Predo_data")  # defaults to "log" when log_y=True
 
 if __name__ == "__main__":
     _demo()

@@ -33,11 +33,38 @@ from typing import Tuple
 from jax import lax
 from jaxopt import LBFGS
 import json
-from flax import serialization
+from flax import serialization as sz
 jax.config.update('jax_platform_name', 'cpu')
 ArrayLike = Union[float, int, Sequence[float], np.ndarray]
 
+_SERIALIZERS_REGISTERED = False
 
+def _register_all_serializers_once():
+    """Register custom Flax serializers exactly once per process."""
+    global _SERIALIZERS_REGISTERED
+    if _SERIALIZERS_REGISTERED:
+        return
+    # If the notebook auto-reloads and registration already happened, re-registrations
+    # may throw. We ignore those specific errors to keep it idempotent.
+    def _safe_register(cls, to_state, from_state):
+        try:
+            sz.register_serialization_state(cls, to_state, from_state)
+        except Exception as e:
+            # Flax raises if already registered; ignore those, re-raise others.
+            msg = str(e).lower()
+            if "already registered" in msg or "has been registered" in msg:
+                pass
+            else:
+                raise
+
+    _safe_register(RBF, _kernel_to_state, _kernel_from_state)
+    _safe_register(Matern32, _kernel_to_state, _kernel_from_state)
+    _safe_register(GaussianLikelihood, _lik_to_state, _lik_from_state)
+    _safe_register(ZeroMean, _zeromean_to_state, _zeromean_from_state)
+    _safe_register(GPParams, _gpparams_to_state, _gpparams_from_state)
+    _safe_register(Standardizer, _std_to_state, _std_from_state)
+
+    _SERIALIZERS_REGISTERED = True
 
 class BayesianFLow:
     """
@@ -390,6 +417,84 @@ def load_xy_from_csv(train_csv: Union[str, Path], test_csv: Union[str, Path], di
     yte = jnp.asarray(te["y"].values.astype(np.float32)) if "y" in te.columns else None
     return Xtr, ytr, Xte, yte
 
+
+    
+def _kernel_to_state(k):
+    if isinstance(k, RBF):
+        return {"type": "rbf",
+                "log_amp": np.asarray(k.log_amp),
+                "log_length": np.asarray(k.log_length)}
+    elif isinstance(k, Matern32):
+        return {"type": "matern32",
+                "log_amp": np.asarray(k.log_amp),
+                "log_length": np.asarray(k.log_length)}
+    else:
+        raise TypeError(f"Unknown kernel class: {type(k)}")
+
+def _kernel_from_state(target, state):
+     t = state["type"]
+     log_amp = jnp.asarray(state["log_amp"])
+     log_length = jnp.asarray(state["log_length"])
+     if t == "rbf":
+         return RBF(log_amp, log_length)
+     elif t == "matern32":
+         return Matern32(log_amp, log_length)
+     else:
+         raise ValueError(f"Unknown kernel type: {t}")
+
+def _lik_to_state(like: GaussianLikelihood):
+    if like.log_noise is None:
+        return {"mode": "fixed", "fixed_noise": float(like.fixed_noise if like.fixed_noise is not None else 1e-3)}
+    else:
+        return {"mode": "learnable", "log_noise": np.asarray(like.log_noise)}
+
+
+def _lik_from_state(target, state):
+     if state["mode"] == "fixed":
+         return GaussianLikelihood(log_noise=None, fixed_noise=float(state["fixed_noise"]))
+     else:
+         return GaussianLikelihood(log_noise=jnp.asarray(state["log_noise"]), fixed_noise=None)
+
+
+def _zeromean_to_state(m: ZeroMean):
+    return {"type": "zero"}
+
+def _zeromean_from_state(target, state):
+     return ZeroMean()
+
+def _gpparams_to_state(p: GPParams):
+    return {
+        "kernel": _kernel_to_state(p.kernel),
+        "likelihood": _lik_to_state(p.likelihood),
+        "mean": _zeromean_to_state(p.mean_fn),
+    }
+
+def _gpparams_from_state(target, state):
+     return GPParams(
+         kernel=_kernel_from_state(None, state["kernel"]),
+         likelihood=_lik_from_state(None, state["likelihood"]),
+         mean_fn=_zeromean_from_state(None, state["mean"]),
+     )
+
+def _std_to_state(s: Standardizer):
+    return {
+        "x_mean": None if s.x_mean is None else np.asarray(s.x_mean),
+        "x_std":  None if s.x_std  is None else np.asarray(s.x_std),
+        "y_mean": s.y_mean,
+        "y_std":  s.y_std,
+    }
+
+def _std_from_state(target, state):
+     return Standardizer(
+         x_mean=None if state["x_mean"] is None else jnp.asarray(state["x_mean"]),
+         x_std=None  if state["x_std"]  is None else jnp.asarray(state["x_std"]),
+         y_mean=state["y_mean"],
+         y_std=state["y_std"],
+     )
+
+
+
+# -------------------------------
 # -------------------------------
 # End-to-end class
 # -------------------------------
@@ -631,44 +736,19 @@ class MiniGPJax:
         df.to_csv(out / "test_predictions.csv", index=False)
         return metrics
     
-    def _save_relevance_plots(self, out: Path):
-        if self.params is None:
-            return
-        ell = np.asarray(softplus(self.params.kernel.log_length))
-        labels = [f"x{i+1}" for i in range(self.dim)]
-    
-        # normalized 1/ell^2
-        rel = 1.0 / (ell ** 2); rel /= (rel.sum() + 1e-12)
-        plt.figure(figsize=(7,4))
-        plt.bar(labels, rel)
-        plt.ylabel("normalized relevance ~ 1/ℓ²")
-        plt.title("ARD Feature Relevance")
-        plt.tight_layout(); plt.savefig(out / "ard_relevance_bar.pdf"); plt.close()
-    
-        # plain inverse lengthscales
-        inv_ell = 1.0 / ell
-        plt.figure(figsize=(7,4))
-        plt.bar(labels, inv_ell)
-        plt.ylabel("1 / lengthscale")
-        plt.title("Inverse Lengthscale (Feature Relevance)")
-        plt.tight_layout(); plt.savefig(out / "inverse_lengthscale_bar.pdf"); plt.close()
-        
-        
     def save_checkpoint(self, ckpt_dir: Union[str, Path]) -> None:
         """
         Saves:
-          - config.json  : minimal constructor args
-          - params.msgpack: GPParams (kernel + likelihood)
-          - std.msgpack   : Standardizer (x/y means & stds)
-        You can rebuild posterior later via `rebuild_posterior()`.
+          - config.json
+          - params.msgpack     (GPParams)
+          - standardizer.msgpack
+          - (optional) You can also save X_train / y_train if desired.
         """
+        _register_all_serializers_once()
         if self.params is None or self.std is None:
             raise RuntimeError("Nothing to save: fit() and load() must have run so params and std exist.")
+        out = Path(ckpt_dir); out.mkdir(parents=True, exist_ok=True)
 
-        out = Path(ckpt_dir)
-        out.mkdir(parents=True, exist_ok=True)
-
-        # 1) config
         cfg = {
             "dim":            int(self.dim),
             "kernel":         str(self.kernel),
@@ -680,11 +760,12 @@ class MiniGPJax:
         }
         (out / "config.json").write_text(json.dumps(cfg, indent=2))
 
-        # 2) params (GP hyperparameters)
-        (out / "params.msgpack").write_bytes(serialization.to_bytes(self.params))
+        (out / "params.msgpack").write_bytes(sz.to_bytes(self.params))
+        (out / "standardizer.msgpack").write_bytes(sz.to_bytes(self.std))
 
-        # 3) standardizer
-        (out / "standardizer.msgpack").write_bytes(serialization.to_bytes(self.std))
+        # Optional: persist train arrays to reconstruct posterior later without reloading CSVs
+        # np.save(out / "X_train.npy", np.asarray(self.X_train) if self.X_train is not None else None)
+        # np.save(out / "y_train.npy", np.asarray(self.y_train) if self.y_train is not None else None)
 
         print(f"[save] Wrote checkpoint to: {out.resolve()}")
 
@@ -695,12 +776,11 @@ class MiniGPJax:
         Posterior is NOT auto-rebuilt because it depends on X_train/y_train in memory.
         After calling this, either:
           - call `model.load(train_csv, test_csv)` then `model.rebuild_posterior()`, or
-          - set `model.X_train`, `model.y_train` yourself and call `rebuild_posterior()`.
+          - set `model.X_train`, `model.y_train` (or load from .npy) and call `rebuild_posterior()`.
         """
+        _register_all_serializers_once()
         src = Path(ckpt_dir)
         cfg = json.loads((src / "config.json").read_text())
-
-        # Instantiate with saved config
         model = cls(
             dim=cfg["dim"],
             kernel=cfg["kernel"],
@@ -711,35 +791,108 @@ class MiniGPJax:
             jitter=cfg["jitter"],
         )
 
-        # Prepare tiny templates for from_bytes (structure only; contents will be overwritten)
-        # Params template must match kernel type & noise mode:
-        tmpl_params = _init_params(
-            dim=cfg["dim"],
-            kernel_type=cfg["kernel"],
-            fixed_noise=cfg["fixed_noise"],
-        )
-        model.params = serialization.from_bytes(tmpl_params, (src / "params.msgpack").read_bytes())
+        tmpl_params = _init_params(dim=cfg["dim"], kernel_type=cfg["kernel"], fixed_noise=cfg["fixed_noise"])
+        model.params = sz.from_bytes(tmpl_params, (src / "params.msgpack").read_bytes())
+        model.std    = sz.from_bytes(Standardizer(), (src / "standardizer.msgpack").read_bytes())
 
-        # Standardizer template is just an empty Standardizer
-        model.std = serialization.from_bytes(Standardizer(), (src / "standardizer.msgpack").read_bytes())
+        # Optional: if you saved these
+        # xt_path, yt_path = src / "X_train.npy", src / "y_train.npy"
+        # if xt_path.exists() and yt_path.exists():
+        #     model.X_train = jnp.asarray(np.load(xt_path, allow_pickle=True))
+        #     model.y_train = jnp.asarray(np.load(yt_path, allow_pickle=True))
 
         print(f"[load] Loaded config+params from: {src.resolve()}")
         return model
 
     def rebuild_posterior(self) -> None:
-        """
-        Recomputes the training posterior (Cholesky and alpha) from
-        current X_train, y_train and learned params.
-        """
         if self.params is None:
             raise RuntimeError("params is None; load checkpoint or fit() first.")
         if self.X_train is None or self.y_train is None:
             raise RuntimeError("X_train/y_train are missing; call load(...), or set them, then rebuild.")
-
         prior = Prior(self.X_train, self.params)
         self.posterior = Posterior.from_prior(prior, self.y_train, jitter=self.jitter)
         print("[posterior] Rebuilt training posterior.")
 
+    def attach_training_from_csv(self, train_csv: Union[str, Path]) -> None:
+        """
+        Read RAW training CSV, apply log transform if self.log_y, and then
+        apply the *loaded* standardizer to populate X_train / y_train.
+        """
+        if self.std is None:
+            raise RuntimeError("Standardizer is missing. Load checkpoint first (or call load(...)).")
+
+        tr = pd.read_csv(train_csv)
+        cols = [f"x{i+1}" for i in range(self.dim)]
+        if "y" not in tr.columns:
+            raise ValueError("Training CSV must contain a 'y' column.")
+
+        Xtr_raw = jnp.asarray(tr[cols].values.astype(np.float32))
+        ytr_raw = jnp.asarray(tr["y"].values.astype(np.float32))
+
+        if self.log_y:
+            if jnp.any(ytr_raw <= 0):
+                raise ValueError("Model expects log_y=True but training y has non-positive values.")
+            ytr = jnp.log(ytr_raw)
+        else:
+            ytr = ytr_raw
+
+        # IMPORTANT: use the *loaded* standardizer stats
+        self.X_train = self.std.transform_X(Xtr_raw)
+        self.y_train = self.std.transform_y(ytr)
+
+    def attach_test_from_csv(self, test_csv: Union[str, Path]) -> None:
+        """
+        Read RAW test CSV and populate X_test / y_test using the *loaded* standardizer.
+        Works whether 'y' exists in test CSV or not.
+        """
+        if self.std is None:
+            raise RuntimeError("Standardizer is missing. Load checkpoint first (or call load(...)).")
+
+        te = pd.read_csv(test_csv)
+        cols = [f"x{i+1}" for i in range(self.dim)]
+        Xte_raw = jnp.asarray(te[cols].values.astype(np.float32))
+        yte = jnp.asarray(te["y"].values.astype(np.float32)) if "y" in te.columns else None
+
+        self.X_test = self.std.transform_X(Xte_raw)
+        if yte is None:
+            self.y_test = None
+        else:
+            if self.log_y:
+                if jnp.any(yte <= 0):
+                    raise ValueError("Model expects log_y=True but test y has non-positive values.")
+                self.y_test = self.std.transform_y(jnp.log(yte))
+            else:
+                self.y_test = self.std.transform_y(yte)
+
+    @classmethod
+    def ready_from_checkpoint(
+        cls,
+        ckpt_dir: Union[str, Path],
+        train_csv: Optional[Union[str, Path]] = None,
+        test_csv: Optional[Union[str, Path]] = None,
+        rebuild: bool = True,
+    ) -> "MiniGPJax":
+        """
+        One-call loader that returns a *ready-to-use* GP.
+
+        Steps:
+          1) load checkpoint (config + GP params + standardizer)
+          2) if train_csv is provided: attach training design with loaded std
+          3) if rebuild=True and training is present: rebuild posterior
+          4) if test_csv is provided: attach test design
+        """
+        _register_all_serializers_once()
+        model = cls.load_checkpoint(ckpt_dir)
+
+        if train_csv is not None:
+            model.attach_training_from_csv(train_csv)
+            if rebuild:
+                model.rebuild_posterior()
+
+        if test_csv is not None:
+            model.attach_test_from_csv(test_csv)
+
+        return model
 # -------------------------------
 # Demo
 # -------------------------------

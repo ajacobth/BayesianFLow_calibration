@@ -4,6 +4,16 @@
 Created on Sun Oct 12 18:11:16 2025
 
 @author: akshayjacobthomas
+
+Some comments on the GP in this code:
+    - The priors are set in the log space of the paramters
+    - I use MAP estimate, however with very weak priors. Precision very low
+    - To change to MLE estimate only return nll in the ok(_) function
+    - I still have to write code to add other priors, but an LLM can help you.
+    - Now, if you dont like working in the log space, just work with Gamma priors
+    to work woth gamma priors you need to write code
+    - Its not always necessary to fit using log_y = True. That was how the data
+    from Pedro was behaving.
 """
 
 from scipy.stats import qmc
@@ -22,8 +32,12 @@ import jax.scipy as jsp
 from typing import Tuple
 from jax import lax
 from jaxopt import LBFGS
+import json
+from flax import serialization
 jax.config.update('jax_platform_name', 'cpu')
 ArrayLike = Union[float, int, Sequence[float], np.ndarray]
+
+
 
 class BayesianFLow:
     """
@@ -219,9 +233,8 @@ class Posterior:
         var = var_lat + self.params.likelihood.noise_var() if include_noise else var_lat
         return mean, jnp.sqrt(jnp.maximum(var, 0.0))
 
-# -------------------------------
-# Objective (nLML + gentle priors)
-# -------------------------------
+
+# marginal likelihood
 
 def negative_log_marginal_likelihood(
     params: GPParams, X: jnp.ndarray, y: jnp.ndarray, jitter: float = 1e-6
@@ -258,6 +271,10 @@ def negative_log_marginal_likelihood(
             jnp.sum(params.kernel.log_length**2) + params.kernel.log_amp**2 +
             (0.0 if params.likelihood.log_noise is None else params.likelihood.log_noise**2)
         )
+        
+###------------------------------------------
+## TO HAVE PURE MLE only return nll abnd commnet out the rest of the paramters
+#########
         return nll + reg_amp + reg_len + reg_noise + reg_l2
 
     return jax.lax.cond(any_bad, penalized, ok, operand=None)
@@ -635,6 +652,93 @@ class MiniGPJax:
         plt.ylabel("1 / lengthscale")
         plt.title("Inverse Lengthscale (Feature Relevance)")
         plt.tight_layout(); plt.savefig(out / "inverse_lengthscale_bar.pdf"); plt.close()
+        
+        
+    def save_checkpoint(self, ckpt_dir: Union[str, Path]) -> None:
+        """
+        Saves:
+          - config.json  : minimal constructor args
+          - params.msgpack: GPParams (kernel + likelihood)
+          - std.msgpack   : Standardizer (x/y means & stds)
+        You can rebuild posterior later via `rebuild_posterior()`.
+        """
+        if self.params is None or self.std is None:
+            raise RuntimeError("Nothing to save: fit() and load() must have run so params and std exist.")
+
+        out = Path(ckpt_dir)
+        out.mkdir(parents=True, exist_ok=True)
+
+        # 1) config
+        cfg = {
+            "dim":            int(self.dim),
+            "kernel":         str(self.kernel),
+            "fixed_noise":    (None if self.fixed_noise is None else float(self.fixed_noise)),
+            "standardize_x":  bool(self.standardize_x),
+            "standardize_y":  bool(self.standardize_y),
+            "log_y":          bool(self.log_y),
+            "jitter":         float(self.jitter),
+        }
+        (out / "config.json").write_text(json.dumps(cfg, indent=2))
+
+        # 2) params (GP hyperparameters)
+        (out / "params.msgpack").write_bytes(serialization.to_bytes(self.params))
+
+        # 3) standardizer
+        (out / "standardizer.msgpack").write_bytes(serialization.to_bytes(self.std))
+
+        print(f"[save] Wrote checkpoint to: {out.resolve()}")
+
+    @classmethod
+    def load_checkpoint(cls, ckpt_dir: Union[str, Path]) -> "MiniGPJax":
+        """
+        Loads a model with GP hyperparameters and Standardizer.
+        Posterior is NOT auto-rebuilt because it depends on X_train/y_train in memory.
+        After calling this, either:
+          - call `model.load(train_csv, test_csv)` then `model.rebuild_posterior()`, or
+          - set `model.X_train`, `model.y_train` yourself and call `rebuild_posterior()`.
+        """
+        src = Path(ckpt_dir)
+        cfg = json.loads((src / "config.json").read_text())
+
+        # Instantiate with saved config
+        model = cls(
+            dim=cfg["dim"],
+            kernel=cfg["kernel"],
+            fixed_noise=cfg["fixed_noise"],
+            standardize_x=cfg["standardize_x"],
+            standardize_y=cfg["standardize_y"],
+            log_y=cfg["log_y"],
+            jitter=cfg["jitter"],
+        )
+
+        # Prepare tiny templates for from_bytes (structure only; contents will be overwritten)
+        # Params template must match kernel type & noise mode:
+        tmpl_params = _init_params(
+            dim=cfg["dim"],
+            kernel_type=cfg["kernel"],
+            fixed_noise=cfg["fixed_noise"],
+        )
+        model.params = serialization.from_bytes(tmpl_params, (src / "params.msgpack").read_bytes())
+
+        # Standardizer template is just an empty Standardizer
+        model.std = serialization.from_bytes(Standardizer(), (src / "standardizer.msgpack").read_bytes())
+
+        print(f"[load] Loaded config+params from: {src.resolve()}")
+        return model
+
+    def rebuild_posterior(self) -> None:
+        """
+        Recomputes the training posterior (Cholesky and alpha) from
+        current X_train, y_train and learned params.
+        """
+        if self.params is None:
+            raise RuntimeError("params is None; load checkpoint or fit() first.")
+        if self.X_train is None or self.y_train is None:
+            raise RuntimeError("X_train/y_train are missing; call load(...), or set them, then rebuild.")
+
+        prior = Prior(self.X_train, self.params)
+        self.posterior = Posterior.from_prior(prior, self.y_train, jitter=self.jitter)
+        print("[posterior] Rebuilt training posterior.")
 
 # -------------------------------
 # Demo
@@ -655,7 +759,7 @@ def _demo():
     )
     gp.load(TRAIN_CSV, TEST_CSV)
     gp.fit(lbfgs_max_iter=50, lbfgs_tol=1e-7, num_restarts=2, seed=42)
-    gp.evaluate_and_plot(outdir="Predo_data")  # defaults to "log" when log_y=True
+    gp.evaluate_and_plot(outdir="DAT_OUT")  # defaults to "log" when log_y=True
 
 if __name__ == "__main__":
     _demo()

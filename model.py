@@ -403,18 +403,34 @@ class Standardizer:
 # -------------------------------
 
 def load_xy_from_csv(train_csv: Union[str, Path], test_csv: Union[str, Path], dim: int):
-    """Load raw X, y from CSVs. No log or scaling here."""
-    tr = pd.read_csv(train_csv); te = pd.read_csv(test_csv)
+    """Load raw X, y from CSVs. Drop rows containing NaNs in any used column."""
+    tr = pd.read_csv(train_csv)
+    te = pd.read_csv(test_csv)
+
     cols = [f"x{i+1}" for i in range(dim)]
+    if "y" not in tr.columns:
+        raise ValueError("Training CSV must contain a 'y' column.")
+
+    # Ensure all required columns exist
     for c in cols:
         if c not in tr.columns or c not in te.columns:
             raise ValueError(f"Missing column {c} in CSVs.")
+
+    # Columns that must be non-NaN
+    req_cols_tr = cols + ["y"]
+    req_cols_te = cols + (["y"] if "y" in te.columns else [])
+
+    # Drop rows with ANY NaN in required columns
+    tr = tr.dropna(subset=req_cols_tr)
+    te = te.dropna(subset=req_cols_te)
+
+    # Convert to jax arrays
     Xtr = jnp.asarray(tr[cols].values.astype(np.float32))
-    Xte = jnp.asarray(te[cols].values.astype(np.float32))
-    if "y" not in tr.columns:
-        raise ValueError("Training CSV must contain a 'y' column.")
     ytr = jnp.asarray(tr["y"].values.astype(np.float32))
+
+    Xte = jnp.asarray(te[cols].values.astype(np.float32))
     yte = jnp.asarray(te["y"].values.astype(np.float32)) if "y" in te.columns else None
+
     return Xtr, ytr, Xte, yte
 
 
@@ -571,7 +587,7 @@ class MiniGPJax:
         tr_rmse = float(np.sqrt(np.mean(tr_resid**2)))
         tr_r2 = float(1.0 - np.sum(tr_resid**2) / (np.sum((np.asarray(ytr_true) - float(np.mean(ytr_true)))**2) + 1e-12))
         print(f"[fit] train RMSE(z)={tr_rmse:.4f} | R²(z)={tr_r2:.4f}  (z = standardized)")
-
+    
     def predict(self, Xnew: Union[np.ndarray, jnp.ndarray], include_noise: bool = True) -> Tuple[np.ndarray, np.ndarray]:
         """Predict in original y units. If log_y=True, uses log-normal moment correction."""
         if self.posterior is None:
@@ -690,7 +706,6 @@ class MiniGPJax:
             df["y_pred_log"] = mu_log
             df.to_csv(out / "test_predictions_log.csv", index=False)
             
-            self._save_relevance_plots(out)
             return metrics
 
         # --- default: original space (only if explicitly requested or log_y=False) ---

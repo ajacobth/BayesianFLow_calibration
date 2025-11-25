@@ -78,8 +78,8 @@ class BayesianFLow:
         self.n_train_samples = n_train_samples
         self.n_test_samples = n_test_samples
         
-        self.lb = np.array([0.34, 1e3, 1e-3, 1e-2, 1.5e-7])
-        self.ub = np.array([0.9, 1e4, 10, 10., 1e-6])
+        self.lb = np.array([0, 1e3, 1e-3, 1e-2, 1.5e-7])
+        self.ub = np.array([1, 1e7, 100, 10., 1e-6])
         
       
     def _sobol_exact(self, n: int, d: int, scramble: bool = True) -> np.ndarray:
@@ -120,7 +120,7 @@ def softplus(x: jnp.ndarray, eps: float = 1e-12) -> jnp.ndarray:
 def _stable_cholesky(K: jnp.ndarray, base_jitter: float = 1e-6) -> jnp.ndarray:
     # Symmetrize, eigen-lift, then Cholesky
     K = 0.5 * (K + K.T)
-    eigvals = jnp.linalg.eigvalsh(K)  # <-- O(N^3) and very expensive
+    eigvals = jnp.linalg.eigvalsh(K)
     diag_mean = jnp.mean(jnp.diag(K))
     scale = jnp.maximum(diag_mean, 1.0)
     floor = base_jitter * scale
@@ -129,7 +129,6 @@ def _stable_cholesky(K: jnp.ndarray, base_jitter: float = 1e-6) -> jnp.ndarray:
     K_spd = K + lift * jnp.eye(K.shape[0], dtype=K.dtype)
     L = jsp.linalg.cholesky(K_spd, lower=True, check_finite=False)
     return L
-
 
 # -------------------------------
 # Mean
@@ -914,12 +913,12 @@ class MiniGPJax:
 # -------------------------------
 
 def _demo():
-    TRAIN_CSV = "11_13_25_train_set.csv"
-    TEST_CSV  = "11_13_25_test_set.csv"
+    TRAIN_CSV = "Completed_train_set_10_30_25.csv"
+    TEST_CSV  = "Completed_test_set_10_30_25.csv"
     dim = 5
     gp = MiniGPJax(
         dim=dim,
-        kernel="matern32",            # or "matern32"
+        kernel="rbf",            # or "matern32"
         fixed_noise=None,        # consider None to learn noise for better generalization
         standardize_x=True,
         standardize_y=True,
@@ -927,8 +926,8 @@ def _demo():
         jitter=1e-6,
     )
     gp.load(TRAIN_CSV, TEST_CSV)
-    gp.fit(lbfgs_max_iter=1, lbfgs_tol=1e-7, num_restarts=2, seed=42)
-    gp.evaluate_and_plot(outdir="11_16")  # defaults to "log" when log_y=True
+    gp.fit(lbfgs_max_iter=2, lbfgs_tol=1e-7, num_restarts=1, seed=42)
+    gp.evaluate_and_plot(outdir="DAT_OUT")  # defaults to "log" when log_y=True
 
 if __name__ == "__main__":
     _demo()
@@ -938,11 +937,11 @@ if __name__ == "__main__":
     
 
 #def main():
-#    # Instantiate and run creating data\
-#        
-#    flow = BayesianFLow(dim=5, n_train_samples=1024, n_test_samples=256)
-#    flow.create_training_set()
-#    flow.create_test_set()
+    # Instantiate and run creating data\
+        
+    # flow = BayesianFLow(dim=5, n_train_samples=1024, n_test_samples=256)
+    # flow.create_training_set()
+    # flow.create_test_set()
 
 
 #if __name__ == "__main__":

@@ -1,0 +1,9 @@
+{
+  "dim": 5,
+  "kernel": "rbf",
+  "fixed_noise": null,
+  "standardize_x": true,
+  "standardize_y": true,
+  "log_y": true,
+  "jitter": 1e-06
+}

@@ -79,7 +79,7 @@ class BayesianFLow:
         self.n_test_samples = n_test_samples
         
         self.lb = np.array([0.34, 1e3, 1e-3, 1e-2, 1.5e-7])
-        self.ub = np.array([0.9, 1e4, 10, 10., 1e-6])
+        self.ub = np.array([0.9, 1e4, 10, 12, 1e-6])
         
       
     def _sobol_exact(self, n: int, d: int, scramble: bool = True) -> np.ndarray:
@@ -930,20 +930,20 @@ def _demo():
     gp.fit(lbfgs_max_iter=1, lbfgs_tol=1e-7, num_restarts=2, seed=42)
     gp.evaluate_and_plot(outdir="11_16")  # defaults to "log" when log_y=True
 
-if __name__ == "__main__":
-    _demo()
-
-    
-    
-    
-
-#def main():
-#    # Instantiate and run creating data\
-#        
-#    flow = BayesianFLow(dim=5, n_train_samples=1024, n_test_samples=256)
-#    flow.create_training_set()
-#    flow.create_test_set()
-
-
 #if __name__ == "__main__":
-#    main()
+#    _demo()
+
+    
+    
+    
+
+def main():
+    # Instantiate and run creating data\
+        
+    flow = BayesianFLow(dim=5, n_train_samples=1024, n_test_samples=256)
+    flow.create_training_set()
+    flow.create_test_set()
+
+
+if __name__ == "__main__":
+    main()

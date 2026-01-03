@@ -78,8 +78,8 @@ class BayesianFLow:
         self.n_train_samples = n_train_samples
         self.n_test_samples = n_test_samples
         
-        self.lb = np.array([0.34, 1e3, 1e-3, 1e-2,  8.89724060054260e-07])
-        self.ub = np.array([0.9, 1e4, 10, 12, 8.89724060054261e-07])
+        self.lb = np.array([0.34, 1e3, 1e-3, 1e-2, 1.5e-7])
+        self.ub = np.array([0.9, 1e4, 10, 12, 1e-6])
         
       
     def _sobol_exact(self, n: int, d: int, scramble: bool = True) -> np.ndarray:
@@ -117,43 +117,19 @@ class BayesianFLow:
 def softplus(x: jnp.ndarray, eps: float = 1e-12) -> jnp.ndarray:
     return jax.nn.softplus(x) + eps
 
-# def _stable_cholesky(K: jnp.ndarray, base_jitter: float = 1e-6) -> jnp.ndarray:
-#     # Symmetrize, eigen-lift, then Cholesky
-#     K = 0.5 * (K + K.T)
-#     eigvals = jnp.linalg.eigvalsh(K)  # <-- O(N^3) and very expensive
-#     diag_mean = jnp.mean(jnp.diag(K))
-#     scale = jnp.maximum(diag_mean, 1.0)
-#     floor = base_jitter * scale
-#     min_ev = jnp.min(eigvals)
-#     lift = jnp.maximum(0.0, floor - min_ev)
-#     K_spd = K + lift * jnp.eye(K.shape[0], dtype=K.dtype)
-#     L = jsp.linalg.cholesky(K_spd, lower=True, check_finite=False)
-#     return L
-
-
-def _stable_cholesky(K: jnp.ndarray, base_jitter: float = 1e-4):
-    """
-    Jitter-escalation Cholesky (LBFGS-safe).
-    Avoids eigendecomposition and keeps gradients smooth.
-    """
+def _stable_cholesky(K: jnp.ndarray, base_jitter: float = 1e-6) -> jnp.ndarray:
+    # Symmetrize, eigen-lift, then Cholesky
     K = 0.5 * (K + K.T)
+    eigvals = jnp.linalg.eigvalsh(K)  # <-- O(N^3) and very expensive
     diag_mean = jnp.mean(jnp.diag(K))
     scale = jnp.maximum(diag_mean, 1.0)
-
-    def body(state):
-        jitter, _ = state
-        Kj = K + jitter * scale * jnp.eye(K.shape[0], dtype=K.dtype)
-        L = jsp.linalg.cholesky(Kj, lower=True, check_finite=False)
-        bad = ~jnp.all(jnp.isfinite(L))
-        return jnp.where(bad, jitter * 10.0, jitter), L
-
-    jitter = base_jitter
-    L = jnp.full_like(K, jnp.nan)
-
-    for _ in range(6):   # max 6 escalations → 1e-4 → 1e+2
-        jitter, L = body((jitter, L))
-
+    floor = base_jitter * scale
+    min_ev = jnp.min(eigvals)
+    lift = jnp.maximum(0.0, floor - min_ev)
+    K_spd = K + lift * jnp.eye(K.shape[0], dtype=K.dtype)
+    L = jsp.linalg.cholesky(K_spd, lower=True, check_finite=False)
     return L
+
 
 # -------------------------------
 # Mean
@@ -168,51 +144,28 @@ class ZeroMean:
 # Kernels
 # -------------------------------
 
-# @dataclass
-# class RBF:
-#     log_amp: jnp.ndarray
-#     log_length: jnp.ndarray
-#     def __call__(self, X: jnp.ndarray, Z: jnp.ndarray) -> jnp.ndarray:
-#         amp = softplus(self.log_amp)
-#         ell = softplus(self.log_length)
-#         diff = (X[:, None, :] - Z[None, :, :]) / ell
-#         sq = jnp.sum(diff * diff, axis=-1)
-#         return (amp ** 2) * jnp.exp(-0.5 * sq)
-#     def tree_flatten(self): return (self.log_amp, self.log_length), ()
-#     @classmethod
-#     def tree_unflatten(cls, aux, children):
-#         log_amp, log_length = children
-#         return cls(log_amp=log_amp, log_length=log_length)
-
 @jax.tree_util.register_pytree_node_class
 @dataclass
 class RBF:
     log_amp: jnp.ndarray
     log_length: jnp.ndarray
-
     def __call__(self, X: jnp.ndarray, Z: jnp.ndarray) -> jnp.ndarray:
         amp = softplus(self.log_amp)
         ell = softplus(self.log_length)
         diff = (X[:, None, :] - Z[None, :, :]) / ell
         sq = jnp.sum(diff * diff, axis=-1)
         return (amp ** 2) * jnp.exp(-0.5 * sq)
-
-    def tree_flatten(self):
-        # children, aux_data
-        return (self.log_amp, self.log_length), None
-
+    def tree_flatten(self): return (self.log_amp, self.log_length), ()
     @classmethod
-    def tree_unflatten(cls, aux_data, children):
+    def tree_unflatten(cls, aux, children):
         log_amp, log_length = children
         return cls(log_amp=log_amp, log_length=log_length)
-
 
 @jax.tree_util.register_pytree_node_class
 @dataclass
 class Matern32:
     log_amp: jnp.ndarray
     log_length: jnp.ndarray
-
     def __call__(self, X: jnp.ndarray, Z: jnp.ndarray) -> jnp.ndarray:
         amp = softplus(self.log_amp)
         ell = softplus(self.log_length)
@@ -220,31 +173,11 @@ class Matern32:
         r = jnp.sqrt(jnp.sum(diff * diff, axis=-1) + 1e-16)
         sqrt3_r = jnp.sqrt(3.0) * r
         return (amp ** 2) * (1.0 + sqrt3_r) * jnp.exp(-sqrt3_r)
-
-    def tree_flatten(self):
-        return (self.log_amp, self.log_length), None
-
+    def tree_flatten(self): return (self.log_amp, self.log_length), ()
     @classmethod
-    def tree_unflatten(cls, aux_data, children):
+    def tree_unflatten(cls, aux, children):
         log_amp, log_length = children
         return cls(log_amp=log_amp, log_length=log_length)
-
-# @dataclass
-# class Matern32:
-#     log_amp: jnp.ndarray
-#     log_length: jnp.ndarray
-#     def __call__(self, X: jnp.ndarray, Z: jnp.ndarray) -> jnp.ndarray:
-#         amp = softplus(self.log_amp)
-#         ell = softplus(self.log_length)
-#         diff = (X[:, None, :] - Z[None, :, :]) / ell
-#         r = jnp.sqrt(jnp.sum(diff * diff, axis=-1) + 1e-16)
-#         sqrt3_r = jnp.sqrt(3.0) * r
-#         return (amp ** 2) * (1.0 + sqrt3_r) * jnp.exp(-sqrt3_r)
-#     def tree_flatten(self): return (self.log_amp, self.log_length), ()
-#     @classmethod
-#     def tree_unflatten(cls, aux, children):
-#         log_amp, log_length = children
-#         return cls(log_amp=log_amp, log_length=log_length)
 
 # -------------------------------
 # Likelihood
@@ -255,23 +188,16 @@ class Matern32:
 class GaussianLikelihood:
     log_noise: Optional[jnp.ndarray]   # None => fixed
     fixed_noise: Optional[float] = None
-
     def noise_var(self) -> jnp.ndarray:
         if self.log_noise is None:
-            return jnp.array(
-                self.fixed_noise if self.fixed_noise is not None else 1e-3,
-                dtype=jnp.float32
-            )
-        sig2 = softplus(self.log_noise) + 1e-6
-        return sig2
-
+            return jnp.array(self.fixed_noise if self.fixed_noise is not None else 1e-3, dtype=jnp.float32)
+        # lower-bound noise ~ 1e-6 via softplus base
+        return softplus(self.log_noise) + 1e-6
     def tree_flatten(self):
-        # children, aux
         if self.log_noise is None:
             return (), ("fixed", float(self.fixed_noise) if self.fixed_noise is not None else 1e-3)
         else:
             return (self.log_noise,), ("learnable", None)
-
     @classmethod
     def tree_unflatten(cls, aux, children):
         mode, fixed = aux
@@ -279,27 +205,6 @@ class GaussianLikelihood:
             return cls(log_noise=None, fixed_noise=fixed)
         (log_noise,) = children
         return cls(log_noise=log_noise, fixed_noise=None)
-
-# class GaussianLikelihood:
-#     log_noise: Optional[jnp.ndarray]   # None => fixed
-#     fixed_noise: Optional[float] = None
-#     def noise_var(self) -> jnp.ndarray:
-#         if self.log_noise is None:
-#             return jnp.array(self.fixed_noise if self.fixed_noise is not None else 1e-3, dtype=jnp.float32)
-#         # lower-bound noise ~ 1e-6 via softplus base
-#         return softplus(self.log_noise) + 1e-6
-#     def tree_flatten(self):
-#         if self.log_noise is None:
-#             return (), ("fixed", float(self.fixed_noise) if self.fixed_noise is not None else 1e-3)
-#         else:
-#             return (self.log_noise,), ("learnable", None)
-#     @classmethod
-#     def tree_unflatten(cls, aux, children):
-#         mode, fixed = aux
-#         if mode == "fixed":
-#             return cls(log_noise=None, fixed_noise=fixed)
-#         (log_noise,) = children
-#         return cls(log_noise=log_noise, fixed_noise=None)
 
 # -------------------------------
 # Params / Prior / Posterior
@@ -359,143 +264,48 @@ class Posterior:
 
 # marginal likelihood
 
-# def negative_log_marginal_likelihood(
-#     params: GPParams, X: jnp.ndarray, y: jnp.ndarray, jitter: float = 1e-6
-# ) -> jnp.ndarray:
-#     K = params.kernel(X, X) + params.likelihood.noise_var() * jnp.eye(X.shape[0], dtype=X.dtype)
-#     m = params.mean_fn(X)
-#     y_c = y - m
-
-#     any_bad = (~jnp.isfinite(K)).any() | (~jnp.isfinite(y_c)).any()
-
-#     def penalized(_):
-#         return jnp.array(1e12, dtype=jnp.float32)
-
-#     def ok(_):
-#         L = _stable_cholesky(K, base_jitter=jitter)
-#         alpha = jsp.linalg.cho_solve((L, True), y_c)
-#         logdet = 2.0 * jnp.sum(jnp.log(jnp.clip(jnp.diag(L), 1e-30)))
-#         nll = 0.5 * (y_c @ alpha) + 0.5 * logdet + 0.5 * X.shape[0] * jnp.log(2.0 * jnp.pi)
-
-#         # ---- Weak priors (on standardized X, y) ----
-#         amp = softplus(params.kernel.log_amp)
-#         ell = softplus(params.kernel.log_length)
-#         log_ell = jnp.log(ell)
-#         reg_amp = 1e-3 * (jnp.log(amp) - 0.0) ** 2
-#         reg_len = 1e-3 * jnp.sum((log_ell - 0.0) ** 2)
-
-#         if params.likelihood.log_noise is not None:
-#             sig2 = softplus(params.likelihood.log_noise) + 1e-6
-#             reg_noise = 5e-4 * (jnp.log(sig2) - jnp.log(1e-2)) ** 2
-#         else:
-#             reg_noise = 0.0
-
-#         reg_l2 = 1e-5 * (
-#             jnp.sum(params.kernel.log_length**2) + params.kernel.log_amp**2 +
-#             (0.0 if params.likelihood.log_noise is None else params.likelihood.log_noise**2)
-#         )
-        
-# ###------------------------------------------
-# ## TO HAVE PURE MLE only return nll abnd commnet out the rest of the paramters
-# #########
-#         return nll + reg_amp + reg_len + reg_noise + reg_l2
-
-#     return jax.lax.cond(any_bad, penalized, ok, operand=None)
-
 def negative_log_marginal_likelihood(
     params: GPParams, X: jnp.ndarray, y: jnp.ndarray, jitter: float = 1e-6
 ) -> jnp.ndarray:
-    """
-    Negative log marginal likelihood (NLL) + negative log priors on hyperparameters (MAP).
-
-    This replaces ad-hoc "reg_*" terms with explicit priors on:
-      - log(amp)
-      - log(lengthscales)
-      - log(noise_var) (if learnable)
-
-    Assumes X and y are already standardized (as in your pipeline).
-    """
-
-    # Build K
-    noise_var = params.likelihood.noise_var()
-    K = params.kernel(X, X) + noise_var * jnp.eye(X.shape[0], dtype=X.dtype)
-
-    # Mean-centering (ZeroMean in your case)
+    K = params.kernel(X, X) + params.likelihood.noise_var() * jnp.eye(X.shape[0], dtype=X.dtype)
     m = params.mean_fn(X)
     y_c = y - m
 
-    # Quick NaN/Inf guard
     any_bad = (~jnp.isfinite(K)).any() | (~jnp.isfinite(y_c)).any()
 
     def penalized(_):
         return jnp.array(1e12, dtype=jnp.float32)
 
     def ok(_):
-        # Stable Cholesky
         L = _stable_cholesky(K, base_jitter=jitter)
-
-        # Solve
         alpha = jsp.linalg.cho_solve((L, True), y_c)
-
-        # NLL
         logdet = 2.0 * jnp.sum(jnp.log(jnp.clip(jnp.diag(L), 1e-30)))
         nll = 0.5 * (y_c @ alpha) + 0.5 * logdet + 0.5 * X.shape[0] * jnp.log(2.0 * jnp.pi)
 
-        # ------------------------------------------------------------
-        # MAP hyperpriors (in log-space)
-        # ------------------------------------------------------------
-        # Use softplus mapping used in your kernel/likelihood
+        # ---- Weak priors (on standardized X, y) ----
         amp = softplus(params.kernel.log_amp)
         ell = softplus(params.kernel.log_length)
-        sig2 = noise_var  # already softplus + floor inside likelihood
-
-        log_amp = jnp.log(amp)
         log_ell = jnp.log(ell)
-        log_sig2 = jnp.log(sig2)
+        reg_amp = 1e-3 * (jnp.log(amp) - 0.0) ** 2
+        reg_len = 1e-3 * jnp.sum((log_ell - 0.0) ** 2)
 
-        # Priors: choose these intentionally.
-        # Since X is standardized, ell ~ O(1) is a reasonable center.
-        # amp in standardized y-space also ~ O(1).
-        #
-        # You can tighten these to prevent exploration.
-        log_amp_loc, log_amp_sd = 0.0, 0.5          # amp ~ LogNormal(0, 0.5)
-        log_ell_loc, log_ell_sd = 0.0, 0.6          # ell_d ~ LogNormal(0, 0.6)
-        log_sig2_loc, log_sig2_sd = jnp.log(1e-2), 0.8  # noise_var ~ LogNormal(log(1e-2), 0.8)
+        if params.likelihood.log_noise is not None:
+            sig2 = softplus(params.likelihood.log_noise) + 1e-6
+            reg_noise = 5e-4 * (jnp.log(sig2) - jnp.log(1e-2)) ** 2
+        else:
+            reg_noise = 0.0
 
-        # Negative log priors (drop constants)
-        nlp_amp = 0.5 * ((log_amp - log_amp_loc) / log_amp_sd) ** 2
-        nlp_ell = 0.5 * jnp.sum(((log_ell - log_ell_loc) / log_ell_sd) ** 2)
-
-        # Only apply noise prior when noise is learnable
-        # (If fixed_noise was provided, sig2 is constant anyway.)
-        noise_is_learnable = params.likelihood.log_noise is not None
-        nlp_noise = jax.lax.cond(
-            noise_is_learnable,
-            lambda _: 0.5 * ((log_sig2 - log_sig2_loc) / log_sig2_sd) ** 2,
-            lambda _: 0.0,
-            operand=None,
+        reg_l2 = 1e-5 * (
+            jnp.sum(params.kernel.log_length**2) + params.kernel.log_amp**2 +
+            (0.0 if params.likelihood.log_noise is None else params.likelihood.log_noise**2)
         )
-
-        # ------------------------------------------------------------
-        # Soft barriers to avoid pathological regions (LBFGS stability)
-        # ------------------------------------------------------------
-        # These are not "priors", they’re *numerical safety*:
-        # - prevent ell from blowing up (flat kernel / rank collapse)
-        # - prevent noise from going to ~0 (nearly singular K)
-        #
-        # Keep them weak; they only activate in extremes.
-        ell_max = 30.0      # in standardized X units
-        sig2_min = 1e-6     # you already have a floor, this is extra guard
-
-        barrier = 0.0
-        barrier = barrier + 1e-3 * jnp.sum(jax.nn.softplus((ell - ell_max) / 1.0) ** 2)
-        barrier = barrier + 1e-3 * (jax.nn.softplus((sig2_min - sig2) / sig2_min) ** 2)
-
-        # Total MAP objective
-        return nll + nlp_amp + nlp_ell + nlp_noise + barrier
+        
+###------------------------------------------
+## TO HAVE PURE MLE only return nll abnd commnet out the rest of the paramters
+#########
+        return nll + reg_amp + reg_len + reg_noise + reg_l2
 
     return jax.lax.cond(any_bad, penalized, ok, operand=None)
-
 
 # -------------------------------
 # Training
